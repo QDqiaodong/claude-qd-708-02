@@ -46,12 +46,23 @@ public class MaintenanceController {
     @PostMapping("/{id}/start")
     public ApiResponse<Views.MaintenanceView> start(@PathVariable("id") Long id,
                                                     @RequestBody MaintenanceDtos.WorkerReq req) {
-        return ApiResponse.success("已开工", maintenanceService.start(id, req));
+        Views.MaintenanceView view = maintenanceService.start(id, req);
+        String message = "MAINTENANCE".equals(view.kartStatus()) ? "已开工，车辆转入维修状态" : "已开工";
+        return ApiResponse.success(message, view);
     }
 
-    /** 完工：车辆回到可用，保养类项目重置上次保养日期 */
+    /** 完工：该车无其他未结工单时车辆恢复可用，否则保持维修并明确提示 */
     @PostMapping("/{id}/complete")
     public ApiResponse<Views.MaintenanceView> complete(@PathVariable("id") Long id) {
-        return ApiResponse.success("已完工，车辆恢复可用", maintenanceService.complete(id));
+        Views.MaintenanceView view = maintenanceService.complete(id);
+        String message;
+        if ("MAINTENANCE".equals(view.kartStatus())) {
+            message = "已完工；该车还有其他未结维修单，车辆保持「维修」状态";
+        } else if ("AVAILABLE".equals(view.kartStatus())) {
+            message = "已完工，车辆恢复可用";
+        } else {
+            message = "已完工";
+        }
+        return ApiResponse.success(message, view);
     }
 }

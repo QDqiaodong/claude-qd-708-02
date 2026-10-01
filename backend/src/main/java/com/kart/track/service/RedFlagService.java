@@ -248,7 +248,8 @@ public class RedFlagService {
             throw new BizException(check.getKartId() + " 号车已核查为「"
                     + TrackDict.checkConclusionName(check.getConclusion()) + "」，结论提交后不可修改");
         }
-        Kart kart = kartRepository.findById(check.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
+        // 锁车辆行：与维修模块的完工/转状态串行，送修建单与车辆状态不会和完工动作交错出矛盾
+        Kart kart = kartRepository.findByIdForUpdate(check.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
 
         LocalDateTime now = LocalDateTime.now();
         check.setConclusion(conclusion);

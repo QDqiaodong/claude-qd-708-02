@@ -202,6 +202,9 @@ public final class TrackDict {
             "REPAIRING", "维修中",
             "DONE", "已完工");
 
+    /** 未结工单状态（待修 + 维修中）：判定「该车是否还有未结维修」的统一口径 */
+    public static final java.util.List<String> MAINT_OPEN_STATUSES = java.util.List.of("WAITING", "REPAIRING");
+
     /** 工时费单价（元/小时） */
     public static final BigDecimal LABOR_RATE = BigDecimal.valueOf(80);
 

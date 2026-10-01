@@ -31,12 +31,12 @@
           </div>
           <div class="kart-sub">上次保养：{{ k.lastServiceDate || '未保养' }} · {{ k.serviceDueText }}</div>
           <div class="kart-actions">
-            <el-button v-if="k.status === 'AVAILABLE'" size="small" type="danger" @click="dispatch(k)">派车到本场</el-button>
-            <el-button v-if="k.status === 'ON_TRACK'" size="small" type="warning" @click="recall(k)">收车</el-button>
-            <el-button v-if="k.status === 'AVAILABLE'" size="small" @click="setStatus(k, 'MAINTENANCE')">转维修</el-button>
-            <el-button v-if="k.status === 'MAINTENANCE'" size="small" @click="setStatus(k, 'AVAILABLE')">转可用</el-button>
-            <el-button v-if="k.status === 'AVAILABLE'" size="small" @click="setStatus(k, 'DISABLED')">停用</el-button>
-            <el-button v-if="k.status === 'DISABLED'" size="small" @click="setStatus(k, 'AVAILABLE')">启用</el-button>
+            <el-button v-if="k.status === 'AVAILABLE'" size="small" type="danger" :disabled="acting" @click="dispatch(k)">派车到本场</el-button>
+            <el-button v-if="k.status === 'ON_TRACK'" size="small" type="warning" :disabled="acting" @click="recall(k)">收车</el-button>
+            <el-button v-if="k.status === 'AVAILABLE'" size="small" :disabled="acting" @click="setStatus(k, 'MAINTENANCE')">转维修</el-button>
+            <el-button v-if="k.status === 'MAINTENANCE'" size="small" :disabled="acting" @click="setStatus(k, 'AVAILABLE')">转可用</el-button>
+            <el-button v-if="k.status === 'AVAILABLE'" size="small" :disabled="acting" @click="setStatus(k, 'DISABLED')">停用</el-button>
+            <el-button v-if="k.status === 'DISABLED'" size="small" :disabled="acting" @click="setStatus(k, 'AVAILABLE')">启用</el-button>
           </div>
           <div v-if="k.sessionNo" class="kart-sub">当前场次：{{ k.sessionNo }}</div>
         </div>
@@ -74,6 +74,8 @@ const track = inject('track')
 const rows = ref([])
 const dialog = ref(false)
 const form = ref({ kartNo: '', model: 'FUN', engineCc: 270, maxPower: 13.5, serviceIntervalH: 50 })
+/** 有请求在途时禁用所有状态按钮，防止连点产生并发写 */
+const acting = ref(false)
 
 async function load() {
   rows.value = await kartApi.list()
@@ -97,29 +99,39 @@ function statusClass(status) {
   return 'mute'
 }
 
+/** 包一层在途标记；失败（如该车还有未结维修单）时提示由拦截器弹出，并刷新对齐后端状态 */
+async function run(fn) {
+  if (acting.value) return
+  acting.value = true
+  try {
+    await fn()
+    await load()
+    await track.refreshOverview()
+  } catch (e) {
+    await load().catch(() => {})
+    await track.refreshOverview().catch(() => {})
+  } finally {
+    acting.value = false
+  }
+}
+
 async function setStatus(kart, status) {
-  await kartApi.setStatus(kart.id, status)
-  await load()
-  await track.refreshOverview()
+  await run(() => kartApi.setStatus(kart.id, status))
 }
 
 async function dispatch(kart) {
-  await kartApi.dispatch(kart.id, track.sessionId.value)
-  await load()
-  await track.refreshOverview()
+  await run(() => kartApi.dispatch(kart.id, track.sessionId.value))
 }
 
 async function recall(kart) {
-  await kartApi.recall(kart.id)
-  await load()
-  await track.refreshOverview()
+  await run(() => kartApi.recall(kart.id))
 }
 
 async function submit() {
-  await kartApi.create(form.value)
-  dialog.value = false
-  await load()
-  await track.refreshOverview()
+  await run(async () => {
+    await kartApi.create(form.value)
+    dialog.value = false
+  })
 }
 
 watch(() => track.sessionId.value, () => load())

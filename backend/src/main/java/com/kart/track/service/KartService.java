@@ -15,12 +15,14 @@ import org.springframework.transaction.annotation.Transactional;
 import com.kart.track.common.BizException;
 import com.kart.track.domain.Kart;
 import com.kart.track.domain.LapRecord;
+import com.kart.track.domain.Maintenance;
 import com.kart.track.domain.RaceSession;
 import com.kart.track.domain.TrackDict;
 import com.kart.track.dto.KartDtos;
 import com.kart.track.dto.Views;
 import com.kart.track.repository.KartRepository;
 import com.kart.track.repository.LapRecordRepository;
+import com.kart.track.repository.MaintenanceRepository;
 import com.kart.track.repository.RaceSessionRepository;
 import com.kart.track.repository.RedFlagEventRepository;
 
@@ -32,15 +34,18 @@ public class KartService {
     private final RaceSessionRepository sessionRepository;
     private final LapRecordRepository lapRecordRepository;
     private final RedFlagEventRepository redFlagEventRepository;
+    private final MaintenanceRepository maintenanceRepository;
 
     public KartService(KartRepository kartRepository,
                        RaceSessionRepository sessionRepository,
                        LapRecordRepository lapRecordRepository,
-                       RedFlagEventRepository redFlagEventRepository) {
+                       RedFlagEventRepository redFlagEventRepository,
+                       MaintenanceRepository maintenanceRepository) {
         this.kartRepository = kartRepository;
         this.sessionRepository = sessionRepository;
         this.lapRecordRepository = lapRecordRepository;
         this.redFlagEventRepository = redFlagEventRepository;
+        this.maintenanceRepository = maintenanceRepository;
     }
 
     @Transactional(readOnly = true)
@@ -87,10 +92,10 @@ public class KartService {
         return toView(kartRepository.save(kart), null);
     }
 
-    /** 状态切换：可用 ↔ 维修 ↔ 停用（在赛只能由派车/收车产生） */
+    /** 状态切换：可用 ↔ 维修 ↔ 停用（在赛只能由派车/收车产生）；有未结维修单的车不允许转可用 */
     @Transactional
     public Views.KartView changeStatus(Long id, KartDtos.StatusReq req) {
-        Kart kart = kartRepository.findById(id).orElseThrow(() -> new BizException("车辆不存在"));
+        Kart kart = kartRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("车辆不存在"));
         String target = req.getStatus();
         if (!TrackDict.isValidKartStatus(target)) {
             throw new BizException("目标状态不合法");
@@ -101,6 +106,16 @@ public class KartService {
         if ("ON_TRACK".equals(kart.getStatus())) {
             throw new BizException(kart.getKartNo() + " 正在赛道上，请先收车再切换状态");
         }
+        if ("AVAILABLE".equals(target)) {
+            // 与维修模块同一条状态链：还有未结工单的车不能转可用，否则又会被派上赛道
+            List<Maintenance> open = maintenanceRepository.findByKartIdAndStatusInOrderByStartTimeAsc(
+                    kart.getId(), TrackDict.MAINT_OPEN_STATUSES);
+            if (!open.isEmpty()) {
+                Maintenance first = open.get(0);
+                throw new BizException(kart.getKartNo() + " 还有未结维修单 " + first.getOrderNo() + "（"
+                        + TrackDict.maintStatusName(first.getStatus()) + "），请先在维修页将其完工再转可用");
+            }
+        }
         kart.setStatus(target);
         kart.setUpdatedAt(LocalDateTime.now());
         return toView(kartRepository.save(kart), null);
@@ -109,7 +124,7 @@ public class KartService {
     /** 派车到本场：可用车 → 在赛，并占用一个名额 */
     @Transactional
     public Views.KartView dispatch(Long id, KartDtos.DispatchReq req) {
-        Kart kart = kartRepository.findById(id).orElseThrow(() -> new BizException("车辆不存在"));
+        Kart kart = kartRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("车辆不存在"));
         if (!"AVAILABLE".equals(kart.getStatus())) {
             throw new BizException("只有「可用」状态的车才能派上赛道，当前为" + TrackDict.kartStatusName(kart.getStatus()));
         }
@@ -135,7 +150,7 @@ public class KartService {
     /** 收车：在赛 → 可用。红旗事件核查清单中的车由处置台接管，不能在此直接收车 */
     @Transactional
     public Views.KartView recall(Long id) {
-        Kart kart = kartRepository.findById(id).orElseThrow(() -> new BizException("车辆不存在"));
+        Kart kart = kartRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("车辆不存在"));
         if (!"ON_TRACK".equals(kart.getStatus())) {
             throw new BizException(kart.getKartNo() + " 当前不在赛道上");
         }

@@ -97,12 +97,14 @@ public final class Views {
             String rulingName) {
     }
 
-    /** 模块五：维修保养 */
+    /** 模块五：维修保养（kartStatus 是操作后车辆的最新状态，前端据此提示车辆是否恢复可用） */
     public record MaintenanceView(
             Long id,
             String orderNo,
             Long kartId,
             String kartNo,
+            String kartStatus,
+            String kartStatusName,
             String maintType,
             String maintTypeName,
             String faultDesc,
