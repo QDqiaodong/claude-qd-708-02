@@ -40,18 +40,21 @@ public class MaintenanceController {
 
     @PostMapping
     public ApiResponse<Views.MaintenanceView> create(@Valid @RequestBody MaintenanceDtos.MaintSaveReq req) {
-        return ApiResponse.success("维修单已开立", maintenanceService.create(req));
+        MaintenanceService.MaintenanceActionResult result = maintenanceService.create(req);
+        return ApiResponse.success(result.message(), result.view());
     }
 
     @PostMapping("/{id}/start")
     public ApiResponse<Views.MaintenanceView> start(@PathVariable("id") Long id,
-                                                    @RequestBody MaintenanceDtos.WorkerReq req) {
-        return ApiResponse.success("已开工", maintenanceService.start(id, req));
+                                                    @RequestBody(required = false) MaintenanceDtos.WorkerReq req) {
+        MaintenanceService.MaintenanceActionResult result = maintenanceService.start(id, req);
+        return ApiResponse.success(result.message(), result.view());
     }
 
-    /** 完工：车辆回到可用，保养类项目重置上次保养日期 */
+    /** 完工：同车无其他未结维修时车辆回到可用，保养类项目重置上次保养日期 */
     @PostMapping("/{id}/complete")
     public ApiResponse<Views.MaintenanceView> complete(@PathVariable("id") Long id) {
-        return ApiResponse.success("已完工，车辆恢复可用", maintenanceService.complete(id));
+        MaintenanceService.MaintenanceActionResult result = maintenanceService.complete(id);
+        return ApiResponse.success(result.message(), result.view());
     }
 }

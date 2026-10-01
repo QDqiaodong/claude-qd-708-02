@@ -21,6 +21,7 @@ import com.kart.track.dto.Views;
 import com.kart.track.repository.DriverRepository;
 import com.kart.track.repository.KartRepository;
 import com.kart.track.repository.LapRecordRepository;
+import com.kart.track.repository.MaintenanceRepository;
 import com.kart.track.repository.RaceSessionRepository;
 import com.kart.track.repository.RedFlagEventRepository;
 import com.kart.track.repository.RedFlagLapRepository;
@@ -37,6 +38,7 @@ public class SessionService {
     private final RedFlagEventRepository redFlagEventRepository;
     private final RedFlagLapRepository redFlagLapRepository;
     private final TimingTakeoverRepository timingTakeoverRepository;
+    private final MaintenanceRepository maintenanceRepository;
 
     public SessionService(RaceSessionRepository sessionRepository,
                           DriverRepository driverRepository,
@@ -44,7 +46,8 @@ public class SessionService {
                           LapRecordRepository lapRecordRepository,
                           RedFlagEventRepository redFlagEventRepository,
                           RedFlagLapRepository redFlagLapRepository,
-                          TimingTakeoverRepository timingTakeoverRepository) {
+                          TimingTakeoverRepository timingTakeoverRepository,
+                          MaintenanceRepository maintenanceRepository) {
         this.sessionRepository = sessionRepository;
         this.driverRepository = driverRepository;
         this.kartRepository = kartRepository;
@@ -52,6 +55,7 @@ public class SessionService {
         this.redFlagEventRepository = redFlagEventRepository;
         this.redFlagLapRepository = redFlagLapRepository;
         this.timingTakeoverRepository = timingTakeoverRepository;
+        this.maintenanceRepository = maintenanceRepository;
     }
 
     @Transactional(readOnly = true)
@@ -122,8 +126,8 @@ public class SessionService {
     /**
      * 场次收口（普通结束 / 红旗强制终止共用）：一次性释放车手与可用车辆。
      *
-     * <p>车辆只把仍在赛（ON_TRACK）的收为可用；已经退出/送修的车保持其状态，
-     * 绝不出现「车辆已放行但维修记录缺失」或维修车被误放的半完成状态。
+     * <p>车辆只把仍在赛（ON_TRACK）的从赛道释放：没有未结维修时回可用，有待修/维修中工单则进维修；
+     * 已经退出/送修的车保持其状态，绝不出现「车辆已放行但维修记录缺失」或维修车被误放的半完成状态。
      */
     void finishSession(RaceSession session, LocalDateTime at) {
         session.setStatus("FINISHED");
@@ -138,9 +142,13 @@ public class SessionService {
         List<Long> onTrackKartIds = lapRecordRepository.findBySessionIdOrderByCreatedAtDesc(session.getId())
                 .stream().map(LapRecord::getKartId).distinct().toList();
         for (Long kartId : onTrackKartIds) {
-            Kart kart = kartRepository.findById(kartId).orElse(null);
+            Kart kart = kartRepository.findByIdForUpdate(kartId).orElse(null);
             if (kart != null && "ON_TRACK".equals(kart.getStatus())) {
-                kart.setStatus("AVAILABLE");
+                if (maintenanceRepository.countByKartIdAndStatusIn(kartId, List.of("WAITING", "REPAIRING")) > 0) {
+                    kart.setStatus("MAINTENANCE");
+                } else {
+                    kart.setStatus("AVAILABLE");
+                }
                 kart.setUpdatedAt(at);
                 kartRepository.save(kart);
             }

@@ -142,6 +142,8 @@ public class LapBookingService {
                 driver.setBestLapMs(lapTimeMs);
                 driverRepository.save(driver);
             }
+            // 取加锁后的同一车辆对象，避免与派车/收车/维修状态更新交叉时覆盖车辆状态。
+            kart = kartRepository.findByIdForUpdate(kart.getId()).orElse(kart);
             BigDecimal km = TrackDict.configLapKm(session.getTrackConfig());
             kart.setTotalKm(kart.getTotalKm().add(km));
             kart.setTotalHours(kart.getTotalHours().add(BigDecimal.valueOf(lapTimeMs / 3600000.0)));

@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,12 +26,23 @@ import com.kart.track.repository.MaintenanceRepository;
 @Service
 public class MaintenanceService {
 
+    private static final String WAITING = "WAITING";
+    private static final String REPAIRING = "REPAIRING";
+    private static final String DONE = "DONE";
+    private static final String AVAILABLE = "AVAILABLE";
+    private static final String MAINTENANCE = "MAINTENANCE";
+    private static final String ON_TRACK = "ON_TRACK";
+
     private final MaintenanceRepository maintenanceRepository;
     private final KartRepository kartRepository;
 
     public MaintenanceService(MaintenanceRepository maintenanceRepository, KartRepository kartRepository) {
         this.maintenanceRepository = maintenanceRepository;
         this.kartRepository = kartRepository;
+    }
+
+    /** 维修操作结果：消息需要根据同车剩余待修/维修中工单动态生成。 */
+    public record MaintenanceActionResult(Views.MaintenanceView view, String message) {
     }
 
     @Transactional(readOnly = true)
@@ -56,11 +68,11 @@ public class MaintenanceService {
         long repairing = 0;
         long done = 0;
         for (Maintenance item : all) {
-            if ("WAITING".equals(item.getStatus())) {
+            if (WAITING.equals(item.getStatus())) {
                 waiting += 1;
-            } else if ("REPAIRING".equals(item.getStatus())) {
+            } else if (REPAIRING.equals(item.getStatus())) {
                 repairing += 1;
-            } else if ("DONE".equals(item.getStatus())) {
+            } else if (DONE.equals(item.getStatus())) {
                 done += 1;
                 partsFee = partsFee.add(nz(item.getPartsFee()));
                 totalFee = totalFee.add(nz(item.getTotalFee()));
@@ -71,18 +83,28 @@ public class MaintenanceService {
     }
 
     @Transactional
-    public Views.MaintenanceView create(MaintenanceDtos.MaintSaveReq req) {
+    public MaintenanceActionResult create(MaintenanceDtos.MaintSaveReq req) {
         if (!TrackDict.isValidMaintType(req.getMaintType())) {
             throw new BizException("维修类型不合法");
         }
         if (maintenanceRepository.existsByOrderNo(req.getOrderNo())) {
             throw new BizException("维修单号 " + req.getOrderNo() + " 已存在");
         }
-        Kart kart = kartRepository.findById(req.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
+
+        // 先锁车辆行：同车的开单/开工/完工串行执行，避免两个事务各自按旧车辆状态提交。
+        Kart kart = kartRepository.findByIdForUpdate(req.getKartId())
+                .orElseThrow(() -> new BizException("车辆不存在"));
+        if (ON_TRACK.equals(kart.getStatus())) {
+            throw new BizException(kart.getKartNo() + " 正在赛道上，不能开立维修单；请先收车或在红旗核查中送修");
+        }
+        long repairingCount = maintenanceRepository.countByKartIdAndStatus(kart.getId(), REPAIRING);
+        long waitingCount = maintenanceRepository.countByKartIdAndStatus(kart.getId(), WAITING);
+
         BigDecimal hours = req.getWorkHours() == null ? BigDecimal.ONE : req.getWorkHours();
         BigDecimal parts = req.getPartsFee() == null ? BigDecimal.ZERO : req.getPartsFee();
         BigDecimal total = hours.multiply(TrackDict.LABOR_RATE).add(parts);
 
+        LocalDateTime now = LocalDateTime.now();
         Maintenance item = new Maintenance();
         item.setOrderNo(req.getOrderNo());
         item.setKartId(kart.getId());
@@ -92,58 +114,131 @@ public class MaintenanceService {
         item.setPartsFee(parts);
         item.setTotalFee(total);
         item.setWorker(req.getWorker());
-        item.setStatus("WAITING");
-        item.setStartTime(LocalDateTime.now());
+        item.setStatus(WAITING);
+        item.setStartTime(now);
         item.setEndTime(null);
-        return toView(maintenanceRepository.save(item), kart.getKartNo());
+        Maintenance saved;
+        try {
+            saved = maintenanceRepository.saveAndFlush(item);
+        } catch (DataIntegrityViolationException e) {
+            if (maintenanceRepository.existsByOrderNo(req.getOrderNo())) {
+                throw new BizException("维修单号 " + req.getOrderNo() + " 已存在，请勿重复提交");
+            }
+            throw new BizException("维修单保存失败，请检查数据后重试");
+        }
+
+        String message;
+        if (repairingCount > 0 || waitingCount > 0) {
+            // 只要该车存在未结工单，新增待修单也必须继续锁住车辆，不能给后续派车留下可用状态。
+            ensureMaintenance(kart, now);
+            long waitingAfter = waitingCount + 1;
+            message = "维修单已开立；" + kart.getKartNo() + " 现有 " + (repairingCount + waitingAfter)
+                    + " 张未结工单（维修中 " + repairingCount + "、待修 " + waitingAfter
+                    + "），车辆继续保持维修";
+        } else {
+            ensureMaintenance(kart, now);
+            message = "维修单已开立；" + kart.getKartNo() + " 已转入维修，待全部未结工单完工后才会恢复可用";
+        }
+        kartRepository.save(kart);
+        return new MaintenanceActionResult(toView(saved, kart.getKartNo()), message);
     }
 
-    /** 开工：待修 → 维修中，车辆置为维修 */
+    /** 开工：待修 → 维修中，车辆置为维修；同车其余未结工单不影响本单状态。 */
     @Transactional
-    public Views.MaintenanceView start(Long id, MaintenanceDtos.WorkerReq req) {
+    public MaintenanceActionResult start(Long id, MaintenanceDtos.WorkerReq req) {
         Maintenance item = maintenanceRepository.findById(id).orElseThrow(() -> new BizException("维修单不存在"));
-        if (!"WAITING".equals(item.getStatus())) {
-            throw new BizException("只有「待修」的维修单可以开工");
+        Long kartId = item.getKartId();
+
+        // 按“车辆行 → 工单行”固定顺序加锁，确保同车并发开工/完工串行且不会死锁。
+        Kart kart = kartRepository.findByIdForUpdate(kartId)
+                .orElseThrow(() -> new BizException("车辆不存在"));
+        item = maintenanceRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("维修单不存在"));
+        if (!WAITING.equals(item.getStatus())) {
+            throw new BizException("只有「待修」的维修单可以开工，当前为"
+                    + TrackDict.maintStatusName(item.getStatus()));
         }
-        Kart kart = kartRepository.findById(item.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
-        if ("ON_TRACK".equals(kart.getStatus())) {
+        if (ON_TRACK.equals(kart.getStatus())) {
             throw new BizException(kart.getKartNo() + " 正在赛道上，不能开工维修");
         }
-        if (req.getWorker() != null && !req.getWorker().isBlank()) {
-            item.setWorker(req.getWorker());
+        String worker = item.getWorker();
+        if (req != null && req.getWorker() != null && !req.getWorker().isBlank()) {
+            worker = req.getWorker().trim();
         }
-        if (item.getWorker() == null || item.getWorker().isBlank()) {
+        if (worker == null || worker.isBlank()) {
             throw new BizException("请填写维修人");
         }
-        item.setStatus("REPAIRING");
+
+        long otherRepairing = maintenanceRepository.countByKartIdAndStatus(kart.getId(), REPAIRING);
+        long otherWaiting = maintenanceRepository.countByKartIdAndStatusAndIdNot(kart.getId(), WAITING, id);
+
+        item.setWorker(worker);
+        item.setStatus(REPAIRING);
         item.setStartTime(LocalDateTime.now());
         maintenanceRepository.save(item);
 
-        kart.setStatus("MAINTENANCE");
-        kart.setUpdatedAt(LocalDateTime.now());
+        ensureMaintenance(kart, LocalDateTime.now());
         kartRepository.save(kart);
-        return toView(item, kart.getKartNo());
+
+        String message;
+        long otherOpen = otherRepairing + otherWaiting;
+        if (otherOpen > 0) {
+            message = "已开工；" + kart.getKartNo() + " 还有 " + otherOpen + " 张未结工单（维修中 "
+                    + otherRepairing + "、待修 " + otherWaiting + "），车辆保持维修";
+        } else {
+            message = "已开工，" + kart.getKartNo() + " 已转入维修";
+        }
+        return new MaintenanceActionResult(toView(item, kart.getKartNo()), message);
     }
 
-    /** 完工：维修中 → 已完工，车辆回到可用；保养类项目重置「上次保养日期」 */
+    /** 完工：维修中 → 已完工；只有同车不存在其他未结工单时，车辆才可恢复可用。 */
     @Transactional
-    public Views.MaintenanceView complete(Long id) {
+    public MaintenanceActionResult complete(Long id) {
         Maintenance item = maintenanceRepository.findById(id).orElseThrow(() -> new BizException("维修单不存在"));
-        if (!"REPAIRING".equals(item.getStatus())) {
-            throw new BizException("只有「维修中」的维修单可以完工");
-        }
-        item.setStatus("DONE");
-        item.setEndTime(LocalDateTime.now());
-        maintenanceRepository.save(item);
+        Long kartId = item.getKartId();
 
-        Kart kart = kartRepository.findById(item.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
-        kart.setStatus("AVAILABLE");
-        kart.setUpdatedAt(LocalDateTime.now());
+        // 与开工/开单使用相同的加锁顺序，保证“最后一张工单完工”不会与另一张开工作业交叉。
+        Kart kart = kartRepository.findByIdForUpdate(kartId)
+                .orElseThrow(() -> new BizException("车辆不存在"));
+        item = maintenanceRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("维修单不存在"));
+        if (!REPAIRING.equals(item.getStatus())) {
+            throw new BizException("只有「维修中」的维修单可以完工，当前为"
+                    + TrackDict.maintStatusName(item.getStatus()));
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        item.setStatus(DONE);
+        item.setEndTime(now);
+        maintenanceRepository.saveAndFlush(item);
+
+        // 已完工历史不参与判断；待修和维修中都属于未结维修，任一存在都不能放车。
+        long repairingLeft = maintenanceRepository.countByKartIdAndStatusAndIdNot(kart.getId(), REPAIRING, id);
+        long waitingLeft = maintenanceRepository.countByKartIdAndStatusAndIdNot(kart.getId(), WAITING, id);
+        long openLeft = repairingLeft + waitingLeft;
+
+        String message;
+        if (openLeft > 0) {
+            ensureMaintenance(kart, now);
+            message = "工单已完工；" + kart.getKartNo() + " 仍有 " + openLeft + " 张未结工单（维修中 "
+                    + repairingLeft + "、待修 " + waitingLeft + "），车辆继续保持维修";
+        } else {
+            kart.setStatus(AVAILABLE);
+            kart.setUpdatedAt(now);
+            message = "工单已完工；" + kart.getKartNo() + " 已无其他未结维修，车辆恢复可用";
+        }
         if (TrackDict.isServiceType(item.getMaintType())) {
             kart.setLastServiceDate(LocalDate.now());
         }
         kartRepository.save(kart);
-        return toView(item, kart.getKartNo());
+        return new MaintenanceActionResult(toView(item, kart.getKartNo()), message);
+    }
+
+    private void ensureMaintenance(Kart kart, LocalDateTime now) {
+        if (!MAINTENANCE.equals(kart.getStatus())) {
+            kart.setStatus(MAINTENANCE);
+        }
+        kart.setUpdatedAt(now);
     }
 
     Views.MaintenanceView toView(Maintenance item, String kartNo) {

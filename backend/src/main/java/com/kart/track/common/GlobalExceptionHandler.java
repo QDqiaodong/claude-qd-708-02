@@ -61,6 +61,18 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 行锁等待/死锁：同车状态变更被并发请求占用，提示刷新后重试，避免返回数据库原始错误。
+     */
+    @ExceptionHandler({
+            org.springframework.dao.CannotAcquireLockException.class,
+            org.springframework.dao.PessimisticLockingFailureException.class
+    })
+    public ResponseEntity<ApiResponse<Void>> handleLock(org.springframework.dao.PessimisticLockingFailureException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail("车辆或工单正在被其他操作更新，请刷新车辆与维修统计后重试"));
+    }
+
+    /**
      * 唯一约束冲突：400（避免在页面上抛出非人话的外键报错）
      */
     @ExceptionHandler(DataIntegrityViolationException.class)

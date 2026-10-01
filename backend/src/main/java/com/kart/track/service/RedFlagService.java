@@ -248,7 +248,8 @@ public class RedFlagService {
             throw new BizException(check.getKartId() + " 号车已核查为「"
                     + TrackDict.checkConclusionName(check.getConclusion()) + "」，结论提交后不可修改");
         }
-        Kart kart = kartRepository.findById(check.getKartId()).orElseThrow(() -> new BizException("车辆不存在"));
+        Kart kart = kartRepository.findByIdForUpdate(check.getKartId())
+                .orElseThrow(() -> new BizException("车辆不存在"));
 
         LocalDateTime now = LocalDateTime.now();
         check.setConclusion(conclusion);
@@ -281,8 +282,9 @@ public class RedFlagService {
             kartRepository.save(kart);
             releaseDriverIfPresent(check, false);
         } else if ("RETIRE".equals(conclusion)) {
-            // 退出比赛：车离赛道回可用池、该车手本场结束；其它在赛车的核查结果一概不动
-            kart.setStatus("AVAILABLE");
+            // 退出比赛：车离赛道回可用池、该车手本场结束；若此前已有排队维修单，则进入维修池。
+            kart.setStatus(maintenanceRepository.countByKartIdAndStatusIn(
+                    kart.getId(), List.of("WAITING", "REPAIRING")) > 0 ? "MAINTENANCE" : "AVAILABLE");
             kart.setUpdatedAt(now);
             kartRepository.save(kart);
             releaseDriverIfPresent(check, false);
@@ -494,9 +496,13 @@ public class RedFlagService {
         // finishSession 只按圈速记录收车；核查清单是“发起红旗时全部在赛车”的快照
         // （含尚未跑出圈的车），这些车若仍在赛也要在此一并收车，送修车保持 MAINTENANCE
         for (RedFlagCheck check : checkRepository.findAllByEventIdOrderByKartIdAsc(eventId)) {
-            Kart kart = kartRepository.findById(check.getKartId()).orElse(null);
+            Kart kart = kartRepository.findByIdForUpdate(check.getKartId()).orElse(null);
             if (kart != null && "ON_TRACK".equals(kart.getStatus())) {
-                kart.setStatus("AVAILABLE");
+                if (maintenanceRepository.countByKartIdAndStatusIn(kart.getId(), List.of("WAITING", "REPAIRING")) > 0) {
+                    kart.setStatus("MAINTENANCE");
+                } else {
+                    kart.setStatus("AVAILABLE");
+                }
                 kart.setUpdatedAt(now);
                 kartRepository.save(kart);
             }

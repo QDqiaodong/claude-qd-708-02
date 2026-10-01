@@ -43,8 +43,24 @@
         </el-table-column>
         <el-table-column label="操作" width="140">
           <template #default="{ row }">
-            <el-button v-if="row.status === 'WAITING'" link type="warning" @click="start(row)">开工</el-button>
-            <el-button v-if="row.status === 'REPAIRING'" link type="success" @click="complete(row)">完工</el-button>
+            <el-button
+              v-if="row.status === 'WAITING'"
+              link
+              type="warning"
+              :loading="operationKey === `start-${row.id}`"
+              @click="start(row)"
+            >
+              开工
+            </el-button>
+            <el-button
+              v-if="row.status === 'REPAIRING'"
+              link
+              type="success"
+              :loading="operationKey === `complete-${row.id}`"
+              @click="complete(row)"
+            >
+              完工
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -55,9 +71,22 @@
         <el-form-item label="维修单号"><el-input v-model="form.orderNo" placeholder="例如 MT-20260913" /></el-form-item>
         <el-form-item label="车辆">
           <el-select v-model="form.kartId" style="width: 100%">
-            <el-option v-for="k in karts" :key="k.id" :label="k.kartNo + ' · ' + k.modelName" :value="k.id" />
+            <el-option
+              v-for="k in karts"
+              :key="k.id"
+              :label="kartOptionLabel(k)"
+              :value="k.id"
+            />
           </el-select>
         </el-form-item>
+        <el-alert
+          v-if="selectedKart"
+          style="margin: -8px 0 18px 90px"
+          :type="selectedKart.status === 'ON_TRACK' ? 'error' : openCount(selectedKart.id) > 0 ? 'warning' : 'info'"
+          show-icon
+          :closable="false"
+          :title="createAlertText(selectedKart)"
+        />
         <el-form-item label="维修类型">
           <el-select v-model="form.maintType" style="width: 100%">
             <el-option label="换机油" value="OIL" />
@@ -76,14 +105,15 @@
       </el-form>
       <template #footer>
         <el-button @click="dialog = false">取消</el-button>
-        <el-button type="danger" @click="submit">保存</el-button>
+        <el-button type="danger" :loading="saving" @click="submit">保存</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { kartApi, maintenanceApi } from '../api'
 
 const track = inject('track')
@@ -91,7 +121,12 @@ const rows = ref([])
 const karts = ref([])
 const summary = ref({ total: 0, waiting: 0, repairing: 0, done: 0, partsFeeTotal: 0, laborFeeTotal: 0, totalFee: 0 })
 const dialog = ref(false)
-const form = ref({ orderNo: '', kartId: null, maintType: 'OIL', faultDesc: '', workHours: 1, partsFee: 180, worker: '' })
+const saving = ref(false)
+const operationKey = ref('')
+const initialForm = () => ({ orderNo: '', kartId: null, maintType: 'OIL', faultDesc: '', workHours: 1, partsFee: 180, worker: '' })
+const form = ref(initialForm())
+
+const selectedKart = computed(() => karts.value.find((k) => k.id === form.value.kartId))
 
 async function load() {
   rows.value = await maintenanceApi.list()
@@ -99,23 +134,89 @@ async function load() {
   karts.value = await kartApi.list()
 }
 
+function kartOptionLabel(kart) {
+  const statusMap = {
+    AVAILABLE: '可用',
+    ON_TRACK: '在赛',
+    MAINTENANCE: '维修',
+    DISABLED: '停用'
+  }
+  return `${kart.kartNo} · ${kart.modelName} · ${statusMap[kart.status] || kart.status}`
+}
+
+function waitingCount(kartId) {
+  return rows.value.filter((r) => r.kartId === kartId && r.status === 'WAITING').length
+}
+
+function repairingCount(kartId) {
+  return rows.value.filter((r) => r.kartId === kartId && r.status === 'REPAIRING').length
+}
+
+function openCount(kartId) {
+  return waitingCount(kartId) + repairingCount(kartId)
+}
+
+function createAlertText(kart) {
+  if (kart.status === 'ON_TRACK') {
+    return `${kart.kartNo} 正在赛道上，不能直接开立维修单；请先收车或在红旗核查中送修。`
+  }
+  if (openCount(kart.id) > 0) {
+    return `${kart.kartNo} 当前有 ${openCount(kart.id)} 张未结工单（维修中 ${repairingCount(kart.id)}、待修 ${waitingCount(kart.id)}）。新开待修单后车辆继续锁定；任一张工单完工时，仍需确认同车没有其他待修或维修中工单，车辆才会恢复可用。`
+  }
+  return `开立待修单后 ${kart.kartNo} 将转入维修；全部未结工单完工后才会恢复可用。`
+}
+
 async function start(row) {
-  await maintenanceApi.start(row.id, row.worker || '')
-  await load()
-  await track.refreshOverview()
+  operationKey.value = `start-${row.id}`
+  try {
+    let worker = row.worker && row.worker.trim()
+    if (!worker) {
+      const result = await ElMessageBox.prompt(`请输入 ${row.orderNo} 的维修人`, '开工', {
+        confirmButtonText: '开工',
+        cancelButtonText: '取消',
+        inputValidator: (value) => Boolean(value && value.trim()) || '请填写维修人'
+      })
+      worker = result.value.trim()
+    }
+
+    await maintenanceApi.start(row.id, worker)
+    await load()
+    await track.refreshOverview()
+  } catch (err) {
+    if (err !== 'cancel' && err !== 'close') {
+      await load()
+      await track.refreshOverview()
+    }
+  } finally {
+    operationKey.value = ''
+  }
 }
 
 async function complete(row) {
-  await maintenanceApi.complete(row.id)
-  await load()
-  await track.refreshOverview()
+  operationKey.value = `complete-${row.id}`
+  try {
+    await maintenanceApi.complete(row.id)
+    await load()
+    await track.refreshOverview()
+  } catch (err) {
+    await load()
+    await track.refreshOverview()
+  } finally {
+    operationKey.value = ''
+  }
 }
 
 async function submit() {
-  await maintenanceApi.create(form.value)
-  dialog.value = false
-  await load()
-  await track.refreshOverview()
+  saving.value = true
+  try {
+    await maintenanceApi.create(form.value)
+    dialog.value = false
+    form.value = initialForm()
+    await load()
+    await track.refreshOverview()
+  } finally {
+    saving.value = false
+  }
 }
 
 onMounted(load)
